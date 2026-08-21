@@ -1,0 +1,143 @@
+{
+  "danbooru_username": {
+    "type": "string",
+    "description": "Danbooru 用户名",
+    "default": ""
+  },
+  "danbooru_api_key": {
+    "type": "string",
+    "description": "Danbooru API Key",
+    "hint": "与用户名一起用于 posts.json 与 tags.json 的 Basic Auth。",
+    "default": ""
+  },
+  "danbooru_user_agent": {
+    "type": "string",
+    "description": "请求 User-Agent",
+    "hint": "推荐保留默认格式；可在括号中添加你的联系方式。不要伪装成 Mozilla 浏览器。",
+    "default": "AstrBot-Danbooru-TagAPI/1.0"
+  },
+  "max_api_query_terms": {
+    "type": "int",
+    "description": "每次 posts 搜索最多使用的普通 tag 数",
+    "hint": "默认 2，适配未登录/Member；Gold 可设为 6，Platinum+ 在本插件中最多可设为 10。漫画命令固定占用其中 1 个。超过的用户 tag 会被忽略。",
+    "default": 2
+  },
+  "enable_r18_search": {
+    "type": "bool",
+    "description": "启用 /danbooru_r18 命令",
+    "hint": "默认关闭。开启后该命令只查询 Danbooru 的 Questionable 与 Explicit 评级。",
+    "default": false
+  },
+  "tag_suggestion_limit": {
+    "type": "int",
+    "description": "tags API 候选数量",
+    "hint": "用于 /danbooru_tags 和拼写校验；建议 10～20。",
+    "default": 15
+  },
+  "tag_cache_ttl_seconds": {
+    "type": "int",
+    "description": "标签校验缓存时间（秒）",
+    "hint": "减少重复调用 tags API；900 即 15 分钟。",
+    "default": 900
+  },
+  "allow_unverified_tags_on_api_error": {
+    "type": "bool",
+    "description": "tags API 故障时是否放行未验证英文 tag",
+    "hint": "建议关闭，避免拼写错误或异常输入直接传给 posts API。",
+    "default": false
+  },
+  "enable_chinese_lookup": {
+    "type": "bool",
+    "description": "启用中文/日文对照查找",
+    "hint": "通过外部对照服务或本地词典把中文词映射到官方 Danbooru tag。查找在插件代码侧完成，不经过 LLM。",
+    "default": true
+  },
+  "chinese_lookup_url": {
+    "type": "string",
+    "description": "中文对照 suggest API 地址",
+    "hint": "默认 tagsuggest.zeabur.app。响应需包含 results 数组，每项有 name / cn_name / count / category。",
+    "default": "https://tagsuggest.zeabur.app/api/tags/suggest"
+  },
+  "chinese_ambiguity_threshold": {
+    "type": "int",
+    "description": "触发歧义引导的最小候选数",
+    "hint": "同一中文词命中 >= N 个高相关官方 tag 时，不自动搜图，而是列出候选让用户确认。建议 2～4。",
+    "default": 3
+  },
+  "chinese_lookup_limit": {
+    "type": "int",
+    "description": "中文对照单次返回候选上限",
+    "hint": "API 或本地返回的候选数量上限。",
+    "default": 12
+  },
+  "manual_tag_aliases": {
+    "type": "text",
+    "description": "手工中文/别名词典（JSON，WebUI 配置）",
+    "hint": "与 data/danbooru/manual_aliases.json 合并；本地文件优先。键是用户常说的词，值是 1～2 个标准 Danbooru tag。",
+    "editor_mode": true,
+    "editor_language": "json",
+    "default": "{\n  \"初音未来\": \"hatsune_miku\",\n  \"白丝\": \"white_thighhighs\",\n  \"初音未来白丝\": \"hatsune_miku white_thighhighs\",\n  \"芙莉莲\": \"frieren_(sousou_no_frieren)\"\n}"
+  },
+  "alias_admin_ids": {
+    "type": "string",
+    "description": "允许维护别名的用户 QQ 号（空格或逗号分隔）",
+    "hint": "留空则仅依赖 AstrBot 管理员判断（若平台支持）。填写后这些 ID 也可执行 /danbooru_alias 等命令。",
+    "default": ""
+  },
+  "enable_alias_suggestion_log": {
+    "type": "bool",
+    "description": "是否记录中文对照/歧义建议到日志文件",
+    "hint": "写入 data/danbooru/alias_suggestions.jsonl，供管理员审核后手工或命令添加。",
+    "default": true
+  },
+  "result_pool_size": {
+    "type": "int",
+    "description": "每次 posts API 拉取的结果数量",
+    "hint": "1～200。插件优先让 Danbooru 返回广域随机池，再在本地按命令末尾的 :分数过滤。",
+    "default": 100
+  },
+  "recent_history_size": {
+    "type": "int",
+    "description": "每个查询记住的近期图片数",
+    "hint": "用于避免相同 tag 连续搜到重复图片；0 为关闭，建议 100～300。仅保存在插件进程内存中。",
+    "default": 200
+  },
+  "default_positive_tags": {
+    "type": "string",
+    "description": "本地必须包含的 tag",
+    "hint": "不会发送给 Danbooru API，不占 tag 上限；留空最宽松。填 highres 会筛掉未标 highres 的图。",
+    "default": ""
+  },
+  "default_negative_tags": {
+    "type": "string",
+    "description": "本地排除的 tag",
+    "hint": "不会发送给 Danbooru API，不占 tag 上限；多个 tag 用空格分隔，需带 -。漫画命令会自动放行 comic/4koma/text 等漫画常见 tag。",
+    "default": "-ai_generated -comic -4koma -multiple_views -text -speech_bubble -translated"
+  },
+  "exclude_animated": {
+    "type": "bool",
+    "description": "排除动画和视频类结果",
+    "default": true
+  },
+  "max_file_size_mb": {
+    "type": "int",
+    "description": "允许下载并上传到 QQ 的最大图片大小（MB）",
+    "hint": "QQ/OneBot 不稳定时可降到 10 或 15。",
+    "default": 20
+  },
+  "user_cooldown_seconds": {
+    "type": "int",
+    "description": "同一用户两次请求的最短间隔（秒），0 为关闭",
+    "default": 20
+  },
+  "cache_hours": {
+    "type": "int",
+    "description": "本地下载图片缓存保留时长（小时）",
+    "default": 24
+  },
+  "show_query_tags": {
+    "type": "bool",
+    "description": "是否在 QQ 消息中显示最终 API 检索 tag",
+    "default": true
+  }
+}
