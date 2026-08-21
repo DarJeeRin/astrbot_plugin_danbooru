@@ -1,0 +1,8 @@
+name: astrbot_plugin_danbooru
+display_name: Danbooru 图片搜索
+short_desc: 支持中文标签、可选 R18、漫画命令与本地最低分过滤的 Danbooru 图片搜索插件
+desc: 按 Danbooru 标签检索普通、可选 R18 或漫画图片，支持本地最低分过滤
+version: 1.1.0
+author: DarJeeRin
+repo: "https://github.com/DarJeeRin/astrbot_plugin_danbooru"
+astrbot_version: ">=4.26,<5"
