@@ -1,10 +1,12 @@
 # AstrBot Danbooru 图片搜索插件
 
-一个面向 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 的 Danbooru 搜图插件。支持中英文标签解析、普通图片、可选 R18、独立漫画搜索、命令级最低评分过滤，以及尽量减少重复的广域随机策略。
+一个面向 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 的 Danbooru 搜图插件。中文语义标签由 DanbooruSearchOnline 解析，并按置信度决定直接搜图或返回候选；另支持擅长画师推荐、可选 R18、独立漫画搜索、命令级最低评分过滤，以及尽量减少重复的广域随机策略。
 
 ## 功能
 
-- 支持 Danbooru 官方英文 tag，以及可配置的中文/日文标签对照。
+- 支持 Danbooru 官方英文 tag，以及 DanbooruSearchOnline 中文/日文语义搜索。
+- 中文首选结果达到高置信度阈值时直接搜图；中等及以下返回 5～10 个候选 tag。
+- `/danbooru_artists` 使用 DanbooruSearchOnline 擅长画师接口，只返回画师，不请求 Danbooru 图片 API。
 - 普通搜图仅返回 General 与 Sensitive 评级。
 - R18 搜图为独立可选命令，默认关闭，仅返回 Questionable 与 Explicit。
 - 漫画使用独立 `/danbooru_comic` 命令，不会被普通图片的漫画排除规则误杀。
@@ -52,7 +54,8 @@ pip install -r requirements.txt
 | `/danbooru [tag…][:分数]` | 搜索 General + Sensitive 图片 | `/danbooru hatsune_miku solo:150` |
 | `/danbooru_r18 [tag…][:分数]` | 搜索 Questionable + Explicit 图片，默认关闭 | `/danbooru_r18 hatsune_miku:100` |
 | `/danbooru_comic [tag…][:分数]` | 搜索带 `comic` tag 的普通评级漫画 | `/danbooru_comic touhou:50` |
-| `/danbooru_tags 关键词` | 查询官方英文 tag 或中文候选 | `/danbooru_tags 初音未来` |
+| `/danbooru_artists 标签…` | 推荐擅长画师，不搜索或发送图片 | `/danbooru_artists flat_color 1girl` |
+| `/danbooru_tags 关键词` | 查询官方英文 tag 或中文语义候选 | `/danbooru_tags 初音未来` |
 | `/danbooru_help` | 显示普通帮助 | `/danbooru_help` |
 | `/danbooru_help admin` | 管理员查看别名维护帮助 | `/danbooru_help admin` |
 
@@ -104,15 +107,24 @@ enable_r18_search = true
 
 ## 中文标签与别名
 
-中文/日文输入默认通过标签对照服务映射为 Danbooru 官方 tag，不经过 LLM 猜测。若同一个中文词对应多个热门 tag，插件会返回候选，不会静默选择。
+中文/日文输入默认通过 [DanbooruSearchOnline](https://github.com/SuzumiyaAkizuki/DanbooruSearchOnline) 的 `/api/search` 映射为 Danbooru 官方 tag，不经过 LLM 猜测。首个结果的 `semantic_score` 达到 `high_confidence_threshold`，并且与第二名的分差达到 `high_confidence_margin` 时，才直接进入 Danbooru 搜图；否则返回 `candidate_limit` 个候选（配置强制为 5～10 个），不会静默选择。
 
-默认对照服务：
+默认 API：
 
 ```text
-https://tagsuggest.zeabur.app/api/tags/suggest
+https://sakizuki-danboorusearch.hf.space/api
 ```
 
-可关闭 `enable_chinese_lookup`，或通过 `chinese_lookup_url` 更换服务。使用外部服务时，输入的中文关键词会发送给该服务。
+可关闭 `enable_chinese_lookup`，或在 WebUI 的“DanbooruSearchOnline API 搜索与画师参数”区域修改 API 地址和默认搜索参数。使用外部服务时，输入的中文关键词会发送给该服务。
+
+### 擅长画师命令
+
+```text
+/danbooru_artists 平涂
+/danbooru_artists flat_color 1girl
+```
+
+中文输入先由 `/api/search` 做高置信度标签解析，再把标准标签交给 `/api/artists`；英文 tag 直接交给 `/api/artists` 的确定性标签纠错逻辑。此命令不会调用 Danbooru 的 `tags.json` 或 `posts.json`，也不会下载、发送图片。
 
 管理员别名命令：
 
@@ -122,8 +134,26 @@ https://tagsuggest.zeabur.app/api/tags/suggest
 | `/danbooru_alias_del 中文` | 删除本地别名 |
 | `/danbooru_alias_list [关键词]` | 查看本地别名 |
 | `/danbooru_suggest_log [条数]` | 查看最近的中文候选与歧义日志 |
+| `/danbooru_api_params [show]` | 查看当前 SearchOnline 搜索/画师参数 |
+| `/danbooru_api_params 参数=值 [参数=值…]` | 修改参数并立即持久化 |
+| `/danbooru_api_params reset` | 重置参数，保留 API 地址 |
 
 可用 `alias_admin_ids` 配置允许维护别名的用户 ID。平台能够识别管理员身份时，管理员也可直接使用这些命令。
+
+例如无需进入 Bot 后台即可调整置信度和候选数：
+
+```text
+/danbooru_api_params high_confidence_threshold=0.82 candidate_limit=8
+/danbooru_api_params top_k=30 popularity_weight=0.2 use_segmentation=false
+```
+
+可修改参数包括 `top_k`、`limit`、`popularity_weight`、`show_nsfw`、`use_segmentation`、`target_layers`、`target_categories`、`group_mode`、`max_per_group`、`high_confidence_threshold`、`high_confidence_margin`、`candidate_limit`、`request_timeout_seconds`、`cold_start_retries`、`cold_start_retry_delay_seconds`、`artist_limit`、`artist_min_cooc`、`artist_show_nsfw`。命令会调用 AstrBot 的 `save_config()` 持久化，并清除中文查询缓存使新值立即生效。
+
+### HF Space 冷启动
+
+HF Space 无流量时可能休眠，首次请求通常需要约 30～60 秒冷启动。插件默认给 SearchOnline 请求 120 秒超时，并在连接错误、429 或 5xx 临时响应时额外重试 1 次；冷启动失败不会写入负缓存，因此稍后重试仍会真正访问服务。重试次数和间隔可通过 `cold_start_retries`、`cold_start_retry_delay_seconds` 修改。
+
+若仍超时，请等待片刻重试，或先访问 [DanbooruSearchOnline Space](https://huggingface.co/spaces/SAkizuki/DanbooruSearch) 将服务唤醒。
 
 本地数据位于：
 
@@ -160,6 +190,13 @@ data/danbooru/alias_suggestions.jsonl
 | `user_cooldown_seconds` | `20` | 同一用户的请求冷却；0 为关闭 |
 | `cache_hours` | `24` | 已下载图片的缓存保留时间 |
 | `enable_chinese_lookup` | `true` | 启用中文/日文对照 |
+| `danbooru_search_online.api_base_url` | 见上文 | DanbooruSearchOnline API 基础地址 |
+| `danbooru_search_online.high_confidence_threshold` | `0.78` | 中文结果直接搜图的最低语义置信度 |
+| `danbooru_search_online.high_confidence_margin` | `0.05` | 首名相对第二名的最小领先差值 |
+| `danbooru_search_online.candidate_limit` | `8` | 非高置信度时返回的候选数（5～10） |
+| `danbooru_search_online.request_timeout_seconds` | `120` | SearchOnline 单次请求超时 |
+| `danbooru_search_online.cold_start_retries` | `1` | 冷启动临时错误的额外重试次数 |
+| `danbooru_search_online.artist_limit` | `10` | 擅长画师命令返回数量 |
 | `tag_cache_ttl_seconds` | `900` | 标签校验缓存时间 |
 | `show_query_tags` | `true` | 在回复中显示验证标签与实际查询 |
 
@@ -194,6 +231,8 @@ astrbot_plugin_danbooru/
 ├── metadata.yaml
 ├── _conf_schema.json
 ├── requirements.txt
+├── tests/
+│   └── test_search_online.py
 └── README.md
 ```
 
@@ -205,6 +244,12 @@ astrbot_plugin_danbooru/
 - [Danbooru API 帮助](https://shima.donmai.us/wiki_pages/help%3Aapi)
 - [Danbooru 搜索语法](https://safebooru.donmai.us/wiki_pages/help%3Acheatsheet)
 
+## 友情链接
+
+- [DanbooruSearchOnline](https://huggingface.co/spaces/SAkizuki/DanbooruSearch) — 基于语义匹配的Danbooru标签搜索引擎，支持多维匹配与共现关联推荐。
+- [DanbooruSearchOnline 开源项目](https://github.com/SuzumiyaAkizuki/DanbooruSearchOnline)
+- [DanbooruSearchOnline 在线 API 文档](https://sakizuki-danboorusearch.hf.space/api/docs#/)
+
 ## 免责声明
 
-本插件与 AstrBot、Danbooru 及标签对照服务的运营方无隶属关系。图片版权归原作者或权利人所有；使用者应遵守 Danbooru 服务条款、聊天平台规则及所在地法律法规。
+本插件与 AstrBot、Danbooru 及 DanbooruSearchOnline 的运营方无隶属关系。图片版权归原作者或权利人所有；使用者应遵守 Danbooru 服务条款、聊天平台规则及所在地法律法规。

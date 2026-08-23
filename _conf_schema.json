@@ -48,27 +48,127 @@
   },
   "enable_chinese_lookup": {
     "type": "bool",
-    "description": "启用中文/日文对照查找",
-    "hint": "通过外部对照服务或本地词典把中文词映射到官方 Danbooru tag。查找在插件代码侧完成，不经过 LLM。",
+    "description": "启用中文/日文语义标签查找",
+    "hint": "通过 DanbooruSearchOnline 或本地词典把中文词映射到官方 Danbooru tag。查找在插件代码侧完成，不经过 LLM。",
     "default": true
   },
-  "chinese_lookup_url": {
-    "type": "string",
-    "description": "中文对照 suggest API 地址",
-    "hint": "默认 tagsuggest.zeabur.app。响应需包含 results 数组，每项有 name / cn_name / count / category。",
-    "default": "https://tagsuggest.zeabur.app/api/tags/suggest"
-  },
-  "chinese_ambiguity_threshold": {
-    "type": "int",
-    "description": "触发歧义引导的最小候选数",
-    "hint": "同一中文词命中 >= N 个高相关官方 tag 时，不自动搜图，而是列出候选让用户确认。建议 2～4。",
-    "default": 3
-  },
-  "chinese_lookup_limit": {
-    "type": "int",
-    "description": "中文对照单次返回候选上限",
-    "hint": "API 或本地返回的候选数量上限。",
-    "default": 12
+  "danbooru_search_online": {
+    "type": "object",
+    "description": "DanbooruSearchOnline API 搜索与画师参数",
+    "hint": "中文 tag 语义检索与 /danbooru_artists 使用。除 API 地址外，也可由管理员通过 /danbooru_api_params 即时修改并持久化。",
+    "items": {
+      "api_base_url": {
+        "type": "string",
+        "description": "API 基础地址",
+        "hint": "填写挂载到 /api 的基础地址；插件会自动追加 /search 或 /artists。",
+        "default": "https://sakizuki-danboorusearch.hf.space/api"
+      },
+      "top_k": {
+        "type": "int",
+        "description": "Top K（每个向量层）",
+        "hint": "接口范围 1～50。精确查词建议 20。",
+        "default": 20
+      },
+      "limit": {
+        "type": "int",
+        "description": "语义搜索结果上限",
+        "hint": "接口范围 1～500；插件至少请求 candidate_limit 条。",
+        "default": 10
+      },
+      "popularity_weight": {
+        "type": "float",
+        "description": "热度权重",
+        "hint": "范围 0～1；默认 0.15。",
+        "default": 0.15
+      },
+      "show_nsfw": {
+        "type": "bool",
+        "description": "语义搜索包含 NSFW 标签",
+        "default": true
+      },
+      "use_segmentation": {
+        "type": "bool",
+        "description": "启用智能分词",
+        "hint": "单个概念精确查词建议关闭；完整描述检索可开启。",
+        "default": false
+      },
+      "target_layers": {
+        "type": "string",
+        "description": "搜索匹配层（逗号分隔）",
+        "hint": "可选：英文、中文扩展词、释义、中文核心词、artist。",
+        "default": "英文,中文扩展词,释义,中文核心词"
+      },
+      "target_categories": {
+        "type": "string",
+        "description": "搜索标签类别（逗号分隔）",
+        "hint": "可选：General、Artist、Copyright、Character、Meta。普通中文 tag 搜索默认不含 Artist。",
+        "default": "General,Character,Copyright"
+      },
+      "group_mode": {
+        "type": "string",
+        "description": "同类分组模式",
+        "options": ["off", "expand", "diverse"],
+        "default": "off"
+      },
+      "max_per_group": {
+        "type": "int",
+        "description": "每组最多结果数",
+        "default": 2
+      },
+      "high_confidence_threshold": {
+        "type": "float",
+        "description": "直接搜图的高置信度阈值",
+        "hint": "首个结果的 semantic_score 达到此值，且领先第二名足够多，才会直接调用 Danbooru 搜图。范围 0～1。",
+        "default": 0.78
+      },
+      "high_confidence_margin": {
+        "type": "float",
+        "description": "高置信度首名最小领先差值",
+        "hint": "取首名与第二名 semantic_score/final_score 差值中的较大者；低于此值返回候选。范围 0～1。",
+        "default": 0.05
+      },
+      "candidate_limit": {
+        "type": "int",
+        "description": "低于高置信度时返回的候选数",
+        "hint": "按需求限制为 5～10。",
+        "default": 8
+      },
+      "request_timeout_seconds": {
+        "type": "int",
+        "description": "SearchOnline 请求超时（秒）",
+        "hint": "托管服务冷启动可能较慢；范围 10～180。",
+        "default": 120
+      },
+      "cold_start_retries": {
+        "type": "int",
+        "description": "HF 冷启动失败重试次数",
+        "hint": "遇到连接错误或 429/5xx 时额外重试；范围 0～3。失败结果不会写入标签缓存。",
+        "default": 1
+      },
+      "cold_start_retry_delay_seconds": {
+        "type": "float",
+        "description": "冷启动重试间隔（秒）",
+        "hint": "范围 0～10；单次请求本身仍受 request_timeout_seconds 限制。",
+        "default": 2.0
+      },
+      "artist_limit": {
+        "type": "int",
+        "description": "画师推荐数量",
+        "hint": "/danbooru_artists 最多返回的画师数，范围 1～100。",
+        "default": 10
+      },
+      "artist_min_cooc": {
+        "type": "int",
+        "description": "画师最小共现次数",
+        "hint": "对应 /artists 的 min_cooc，范围 1～100。",
+        "default": 3
+      },
+      "artist_show_nsfw": {
+        "type": "bool",
+        "description": "画师擅长标签中包含 NSFW",
+        "default": true
+      }
+    }
   },
   "manual_tag_aliases": {
     "type": "text",

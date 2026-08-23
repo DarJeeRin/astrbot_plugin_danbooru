@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import random
 import re
@@ -58,7 +59,56 @@ TAG_CATEGORY_NAMES = {
 }
 
 
-DEFAULT_CHINESE_LOOKUP_URL = "https://tagsuggest.zeabur.app/api/tags/suggest"
+DEFAULT_SEARCH_API_BASE_URL = "https://sakizuki-danboorusearch.hf.space/api"
+SEARCH_API_SECTION = "danbooru_search_online"
+SEARCH_API_DEFAULTS: dict[str, Any] = {
+    "api_base_url": DEFAULT_SEARCH_API_BASE_URL,
+    "top_k": 20,
+    "limit": 10,
+    "popularity_weight": 0.15,
+    "show_nsfw": True,
+    "use_segmentation": False,
+    "target_layers": "英文,中文扩展词,释义,中文核心词",
+    "target_categories": "General,Character,Copyright",
+    "group_mode": "off",
+    "max_per_group": 2,
+    "high_confidence_threshold": 0.78,
+    "high_confidence_margin": 0.05,
+    "candidate_limit": 8,
+    "request_timeout_seconds": 120,
+    "cold_start_retries": 1,
+    "cold_start_retry_delay_seconds": 2.0,
+    "artist_limit": 10,
+    "artist_min_cooc": 3,
+    "artist_show_nsfw": True,
+}
+
+SEARCH_API_PARAM_SPECS: dict[str, tuple[str, Any, Any]] = {
+    "top_k": ("int", 1, 50),
+    "limit": ("int", 5, 500),
+    "popularity_weight": ("float", 0.0, 1.0),
+    "show_nsfw": ("bool", None, None),
+    "use_segmentation": ("bool", None, None),
+    "target_layers": ("layers", None, None),
+    "target_categories": ("categories", None, None),
+    "group_mode": ("choice", {"off", "expand", "diverse"}, None),
+    "max_per_group": ("int", 1, 100),
+    "high_confidence_threshold": ("float", 0.0, 1.0),
+    "high_confidence_margin": ("float", 0.0, 1.0),
+    "candidate_limit": ("int", 5, 10),
+    "request_timeout_seconds": ("int", 10, 180),
+    "cold_start_retries": ("int", 0, 3),
+    "cold_start_retry_delay_seconds": ("float", 0.0, 10.0),
+    "artist_limit": ("int", 1, 100),
+    "artist_min_cooc": ("int", 1, 100),
+    "artist_show_nsfw": ("bool", None, None),
+}
+SEARCH_API_LAYERS = {"英文", "中文扩展词", "释义", "中文核心词", "artist"}
+SEARCH_API_CATEGORIES = {"General", "Artist", "Copyright", "Character", "Meta"}
+
+
+class SearchOnlineError(RuntimeError):
+    """DanbooruSearchOnline 请求在冷启动重试后仍失败。"""
 
 # 本地可维护数据
 DATA_DIR = Path("data/danbooru")
@@ -93,11 +143,11 @@ class TagResolution:
 
 
 class DanbooruPlugin(Star):
-    """使用 Danbooru tags API 进行实时标签校验和自动补全的图片插件。
+    """使用 DanbooruSearchOnline 解析中文，并用 Danbooru API 搜图的插件。
 
     设计原则：
     1. 不依赖 LLM 猜 tag，也不把整张对照表塞进上下文。
-    2. 中文/别名查找在插件代码侧完成（手册词典 + 本地 JSON + 可选对照 API）。
+    2. 中文/别名查找在插件代码侧完成（手册词典 + 本地 JSON + DanbooruSearchOnline）。
     3. 只自动接受“精确命中”或“仅下划线/连字符差异”的真实 tag。
     4. 歧义（同一中文词对应多个热门官方 tag）时列出候选并引导用户，不静默选择。
     5. 为兼容受限账号，posts.json 默认只发送最多两个普通 tag。
@@ -154,6 +204,95 @@ class DanbooruPlugin(Star):
             if normalized in {"0", "false", "no", "off", ""}:
                 return False
         return bool(value)
+
+    def _search_api_config(self) -> dict[str, Any]:
+        """返回 DanbooruSearchOnline 配置，兼容缺失/损坏的旧配置。"""
+        raw = self.config.get(SEARCH_API_SECTION, {})
+        section = raw if isinstance(raw, dict) else {}
+        merged = dict(SEARCH_API_DEFAULTS)
+        merged.update(section)
+        return merged
+
+    def _search_api_value(self, key: str) -> Any:
+        return self._search_api_config().get(key, SEARCH_API_DEFAULTS[key])
+
+    def _search_api_int(self, key: str) -> int:
+        try:
+            return int(self._search_api_value(key))
+        except (TypeError, ValueError):
+            return int(SEARCH_API_DEFAULTS[key])
+
+    def _search_api_float(self, key: str) -> float:
+        try:
+            return float(self._search_api_value(key))
+        except (TypeError, ValueError):
+            return float(SEARCH_API_DEFAULTS[key])
+
+    def _search_api_bool(self, key: str) -> bool:
+        value = self._search_api_value(key)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on", "是", "开"}:
+                return True
+            if normalized in {"0", "false", "no", "off", "否", "关", ""}:
+                return False
+        return bool(value)
+
+    def _search_api_list(self, key: str, allowed: set[str]) -> list[str]:
+        value = self._search_api_value(key)
+        if isinstance(value, list):
+            parts = [str(item).strip() for item in value]
+        else:
+            parts = [item.strip() for item in re.split(r"[,，;；|]+", str(value or ""))]
+        return [item for item in parts if item in allowed]
+
+    def _search_api_endpoint(self, name: str) -> str:
+        base = str(self._search_api_value("api_base_url") or DEFAULT_SEARCH_API_BASE_URL).strip()
+        base = base.rstrip("/")
+        if base.endswith(f"/{name}"):
+            return base
+        return f"{base}/{name}"
+
+    def _search_api_timeout(self) -> httpx.Timeout:
+        seconds = min(180, max(10, self._search_api_int("request_timeout_seconds")))
+        return httpx.Timeout(connect=min(20.0, float(seconds)), read=float(seconds), write=20.0, pool=20.0)
+
+    async def _post_search_online(self, endpoint: str, body: dict[str, Any]) -> Any:
+        """POST SearchOnline；针对 HF 冷启动的临时错误做有限重试。"""
+        retries = min(3, max(0, self._search_api_int("cold_start_retries")))
+        delay = min(10.0, max(0.0, self._search_api_float("cold_start_retry_delay_seconds")))
+        url = self._search_api_endpoint(endpoint)
+        last_error: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                async with httpx.AsyncClient(
+                    timeout=self._search_api_timeout(),
+                    follow_redirects=True,
+                    headers=self._get_api_headers(),
+                ) as client:
+                    response = await client.post(url, json=body)
+                    response.raise_for_status()
+                    return response.json()
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                status = exc.response.status_code
+                if status not in {429, 500, 502, 503, 504} or attempt >= retries:
+                    break
+            except (httpx.TransportError, ValueError, json.JSONDecodeError) as exc:
+                last_error = exc
+                if attempt >= retries:
+                    break
+            logger.warning(
+                "[Danbooru] SearchOnline 可能正在冷启动，第 %s/%s 次请求失败，将重试: %s",
+                attempt + 1,
+                retries + 1,
+                last_error,
+            )
+            if delay > 0:
+                await asyncio.sleep(delay)
+        raise SearchOnlineError(str(last_error or "未知错误")) from last_error
 
     def _config_mapping(self, key: str) -> dict[str, str]:
         """读取 WebUI dict 配置，或兼容手写 JSON 字符串。"""
@@ -245,6 +384,8 @@ class DanbooruPlugin(Star):
                         "cn_name": str(c.get("cn_name") or ""),
                         "post_count": int(c.get("post_count") or c.get("count") or 0),
                         "category": c.get("category"),
+                        "semantic_score": float(c.get("semantic_score") or 0.0),
+                        "final_score": float(c.get("final_score") or 0.0),
                     }
                     for c in (candidates or [])[:12]
                 ],
@@ -426,10 +567,7 @@ class DanbooruPlugin(Star):
     # ---------------------------------------------------------------------
 
     async def _fetch_chinese_candidates(self, term: str) -> list[dict[str, Any]]:
-        """调用对照 suggest API，把中文词映射到官方 name + cn_name + count。
-
-        结果只作候选；最终是否采用仍由后续逻辑决定（唯一高置信 / 歧义引导）。
-        """
+        """调用 DanbooruSearchOnline /search 做中文语义标签检索。"""
         if not self._config_bool("enable_chinese_lookup", True):
             return []
 
@@ -442,28 +580,34 @@ class DanbooruPlugin(Star):
         if cached is not None:
             return cached
 
-        base_url = self._config_str("chinese_lookup_url", DEFAULT_CHINESE_LOOKUP_URL)
-        if not base_url:
-            return []
-
-        limit = min(30, max(5, self._config_int("chinese_lookup_limit", 12)))
+        candidate_limit = min(10, max(5, self._search_api_int("candidate_limit")))
+        result_limit = min(500, max(candidate_limit, self._search_api_int("limit")))
+        top_k = min(50, max(1, self._search_api_int("top_k")))
+        layers = self._search_api_list("target_layers", SEARCH_API_LAYERS)
+        categories = self._search_api_list("target_categories", SEARCH_API_CATEGORIES)
+        if not layers:
+            layers = ["英文", "中文扩展词", "释义", "中文核心词"]
+        if not categories:
+            categories = ["General", "Character", "Copyright"]
+        request_body = {
+            "query": term,
+            "top_k": top_k,
+            "limit": result_limit,
+            "popularity_weight": min(1.0, max(0.0, self._search_api_float("popularity_weight"))),
+            "show_nsfw": self._search_api_bool("show_nsfw"),
+            "use_segmentation": self._search_api_bool("use_segmentation"),
+            "target_layers": layers,
+            "target_categories": categories,
+            "group_mode": str(self._search_api_value("group_mode") or "off"),
+            "max_per_group": max(1, self._search_api_int("max_per_group")),
+        }
 
         try:
-            async with httpx.AsyncClient(
-                timeout=self._api_timeout(),
-                follow_redirects=True,
-                headers=self._get_api_headers(),
-            ) as client:
-                response = await client.get(
-                    base_url,
-                    params={"q": term},
-                )
-                response.raise_for_status()
-                payload = response.json()
-        except (httpx.HTTPError, ValueError, json.JSONDecodeError) as exc:
-            logger.warning("[Danbooru] 中文对照查询失败: term=%r, error=%s", term, exc)
-            self._chinese_cache_set(cache_key, [])
-            return []
+            payload = await self._post_search_online("search", request_body)
+        except SearchOnlineError as exc:
+            logger.warning("[Danbooru] DanbooruSearchOnline 查询失败: term=%r, error=%s", term, exc)
+            # 冷启动失败不写负缓存，让用户稍后重试时能重新唤醒 Space。
+            raise
 
         raw_list: list[Any]
         if isinstance(payload, dict):
@@ -478,27 +622,36 @@ class DanbooruPlugin(Star):
         for row in raw_list:
             if not isinstance(row, dict):
                 continue
-            name = str(row.get("name") or "").strip().lower()
+            name = str(row.get("tag") or row.get("name") or "").strip().lower()
             if not name or name in seen or not DANBOORU_TAG_RE.fullmatch(name):
                 continue
             seen.add(name)
-            count = int(row.get("count") or row.get("post_count") or 0)
-            category = row.get("category")
             try:
-                category = int(category) if category is not None else None
+                count = int(row.get("count") or row.get("post_count") or 0)
             except (TypeError, ValueError):
-                category = None
+                count = 0
+            try:
+                final_score = float(row.get("final_score") or 0.0)
+            except (TypeError, ValueError):
+                final_score = 0.0
+            try:
+                semantic_score = float(row.get("semantic_score") or 0.0)
+            except (TypeError, ValueError):
+                semantic_score = 0.0
             candidates.append(
                 {
                     "name": name,
                     "cn_name": str(row.get("cn_name") or "").strip(),
                     "post_count": count,
-                    "category": category,
+                    "category": row.get("category"),
+                    "final_score": final_score,
+                    "semantic_score": semantic_score,
+                    "source": str(row.get("source") or ""),
+                    "layer": str(row.get("layer") or ""),
                 }
             )
 
-        candidates.sort(key=lambda r: int(r.get("post_count") or 0), reverse=True)
-        candidates = candidates[:limit]
+        candidates = candidates[:result_limit]
         self._chinese_cache_set(cache_key, candidates)
         logger.info(
             "[Danbooru] 中文对照命中: term=%r, candidates=%s",
@@ -512,52 +665,120 @@ class DanbooruPlugin(Star):
         term: str,
         candidates: list[dict[str, Any]],
     ) -> tuple[str | None, bool, list[dict[str, Any]]]:
-        """从中文候选里决定：唯一官方 tag / 歧义 / 无可用。
+        """按语义置信度决定直接搜图或返回 5～10 个候选。
 
         返回 (official_tag | None, is_ambiguous, suggestions)
         """
         if not candidates:
             return None, False, []
 
-        threshold = max(2, self._config_int("chinese_ambiguity_threshold", 3))
-        original = term.strip()
-
-        # 1) cn_name 精确匹配优先
-        exact = [
-            c
-            for c in candidates
-            if str(c.get("cn_name") or "").strip() == original
-            or str(c.get("cn_name") or "").strip().casefold() == original.casefold()
-        ]
-        if len(exact) == 1:
-            return exact[0]["name"], False, candidates[:8]
-        if len(exact) > 1:
-            # 多个精确中文名（少见），按热度取前 threshold 视为歧义
-            if len(exact) >= threshold:
-                return None, True, exact[:12]
-            return exact[0]["name"], False, exact[:8]
-
-        # 2) 无精确时：若头部明显领先且总数不多，可自动采用第一名
         top = candidates[0]
-        top_count = int(top.get("post_count") or 0)
-        if len(candidates) == 1 and top_count > 0:
-            return top["name"], False, candidates[:8]
+        semantic_score = float(top.get("semantic_score") or 0.0)
+        final_score = float(top.get("final_score") or 0.0)
+        confidence = semantic_score if semantic_score > 0 else final_score
+        threshold = min(1.0, max(0.0, self._search_api_float("high_confidence_threshold")))
+        required_margin = min(1.0, max(0.0, self._search_api_float("high_confidence_margin")))
+        suggestions = candidates[: min(10, max(5, self._search_api_int("candidate_limit")))]
+        if len(candidates) == 1:
+            lead = 1.0
+        else:
+            second = candidates[1]
+            second_semantic = float(second.get("semantic_score") or 0.0)
+            second_final = float(second.get("final_score") or 0.0)
+            lead = max(semantic_score - second_semantic, final_score - second_final)
+        if confidence >= threshold and lead >= required_margin:
+            return str(top["name"]), False, suggestions
+        return None, True, suggestions
 
-        # 头部显著领先（例如第一名比第二名高一个数量级且很高）时放宽
-        if len(candidates) >= 2:
-            second_count = int(candidates[1].get("post_count") or 0)
-            if top_count >= 5000 and (second_count == 0 or top_count >= second_count * 5):
-                return top["name"], False, candidates[:8]
+    async def _fetch_recommended_artists(self, tags: list[str]) -> dict[str, Any]:
+        """仅调用 DanbooruSearchOnline /artists，不访问 Danbooru API。"""
+        body = {
+            "tags": tags,
+            "limit": min(100, max(1, self._search_api_int("artist_limit"))),
+            "min_cooc": min(100, max(1, self._search_api_int("artist_min_cooc"))),
+            "show_nsfw": self._search_api_bool("artist_show_nsfw"),
+        }
+        try:
+            payload = await self._post_search_online("artists", body)
+        except SearchOnlineError as exc:
+            logger.warning("[Danbooru] 擅长画师接口失败: tags=%r, error=%s", tags, exc)
+            return {
+                "error": (
+                    "DanbooruSearchOnline 暂时不可用，HF Space 可能正在冷启动。"
+                    "请等待 30～60 秒后重试，或先访问服务主页唤醒："
+                    "https://huggingface.co/spaces/SAkizuki/DanbooruSearch"
+                )
+            }
+        if not isinstance(payload, dict):
+            return {"error": "擅长画师接口返回了无法识别的数据。"}
+        return payload
 
-        # 3) 否则视为歧义，交给用户选择
-        if len(candidates) >= threshold:
-            return None, True, candidates[:12]
+    def _parse_search_api_param(self, key: str, raw_value: str) -> Any:
+        spec = SEARCH_API_PARAM_SPECS.get(key)
+        if spec is None:
+            raise ValueError(f"未知参数：{key}")
+        kind, lower, upper = spec
+        value = raw_value.strip()
+        if kind == "int":
+            try:
+                parsed = int(value)
+            except ValueError as exc:
+                raise ValueError(f"{key} 必须是整数") from exc
+            if parsed < int(lower) or parsed > int(upper):
+                raise ValueError(f"{key} 范围为 {lower}～{upper}")
+            return parsed
+        if kind == "float":
+            try:
+                parsed = float(value)
+            except ValueError as exc:
+                raise ValueError(f"{key} 必须是小数") from exc
+            if parsed < float(lower) or parsed > float(upper):
+                raise ValueError(f"{key} 范围为 {lower}～{upper}")
+            return parsed
+        if kind == "bool":
+            normalized = value.casefold()
+            if normalized in {"1", "true", "yes", "on", "是", "开"}:
+                return True
+            if normalized in {"0", "false", "no", "off", "否", "关"}:
+                return False
+            raise ValueError(f"{key} 只能是 true/false（或 开/关）")
+        if kind == "choice":
+            normalized = value.lower()
+            if normalized not in lower:
+                raise ValueError(f"{key} 可选值：{', '.join(sorted(lower))}")
+            return normalized
+        if kind in {"layers", "categories"}:
+            allowed = SEARCH_API_LAYERS if kind == "layers" else SEARCH_API_CATEGORIES
+            values = [item.strip() for item in re.split(r"[,，;；|]+", value) if item.strip()]
+            invalid = [item for item in values if item not in allowed]
+            if not values or invalid:
+                allowed_text = ",".join(sorted(allowed))
+                bad_text = "、".join(invalid) if invalid else "空值"
+                raise ValueError(f"{key} 含无效值 {bad_text}；可选：{allowed_text}")
+            return ",".join(values)
+        raise ValueError(f"不支持的参数类型：{kind}")
 
-        # 候选很少但仍不唯一：也引导，避免静默错选
-        if len(candidates) >= 2:
-            return None, True, candidates[:12]
+    def _format_search_api_params(self) -> str:
+        config = self._search_api_config()
+        lines = ["DanbooruSearchOnline 当前参数："]
+        for key in SEARCH_API_PARAM_SPECS:
+            lines.append(f"  {key}={config.get(key, SEARCH_API_DEFAULTS[key])}")
+        lines.extend(
+            [
+                "",
+                "修改：/danbooru_api_params 参数=值 [参数=值…]",
+                "重置：/danbooru_api_params reset",
+                "例：/danbooru_api_params top_k=30 high_confidence_threshold=0.82 candidate_limit=8",
+            ]
+        )
+        return "\n".join(lines)
 
-        return top["name"], False, candidates[:8]
+    def _save_search_api_config(self, section: dict[str, Any]) -> None:
+        self.config[SEARCH_API_SECTION] = section
+        self.config.save_config()
+        self.chinese_lookup_cache.clear()
+        for key in [key for key in self.tag_lookup_cache if CJK_RE.search(key)]:
+            self.tag_lookup_cache.pop(key, None)
 
     async def _fetch_tag_candidates(
         self,
@@ -635,7 +856,10 @@ class DanbooruPlugin(Star):
                 self._cache_set(cache_key, result)
                 return result
 
-            candidates = await self._fetch_chinese_candidates(raw_tag)
+            try:
+                candidates = await self._fetch_chinese_candidates(raw_tag)
+            except SearchOnlineError:
+                return TagLookupResult(input_tag=raw_tag, api_failed=True, source="chinese")
             official, ambiguous, suggestions = self._pick_chinese_official(raw_tag, candidates)
 
             if official:
@@ -848,11 +1072,17 @@ class DanbooruPlugin(Star):
     def _format_candidate_line(self, item: dict[str, Any]) -> str:
         name = str(item.get("name") or "")
         count = int(item.get("post_count") or item.get("count") or 0)
-        category = TAG_CATEGORY_NAMES.get(item.get("category"), "other")
+        raw_category = item.get("category")
+        category = TAG_CATEGORY_NAMES.get(raw_category, str(raw_category or "other").lower())
         cn = str(item.get("cn_name") or "").strip()
+        try:
+            confidence = float(item.get("semantic_score") or item.get("final_score") or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        score_text = f", 置信度 {confidence:.1%}" if confidence > 0 else ""
         if cn and cn != name:
-            return f"{name}  [{cn}]  ({category}, {count})"
-        return f"{name}  ({category}, {count})"
+            return f"{name}  [{cn}]  ({category}, {count}{score_text})"
+        return f"{name}  ({category}, {count}{score_text})"
 
     def _format_suggestions(self, resolution: TagResolution, limit: int = 6) -> str:
         """把候选以可复制的形式输出给用户。"""
@@ -871,11 +1101,11 @@ class DanbooruPlugin(Star):
     def _format_ambiguity_guidance(self, resolution: TagResolution) -> str:
         """多个热门官方 tag 对应同一中文词时，引导用户精确选择。"""
         lines = [
-            "找到多个相关的官方 tag，请直接复制其中一个再发 /danbooru，或补充更具体的名称：",
+            "语义匹配置信度不足，未直接搜图。请选择一个候选 tag 再发 /danbooru，或补充更具体的名称：",
         ]
         for source, candidates in resolution.ambiguous_terms.items():
             lines.append(f"\n「{source}」可能对应：")
-            for item in candidates[:8]:
+            for item in candidates[: min(10, max(5, self._search_api_int("candidate_limit")))]:
                 lines.append(f"  · {self._format_candidate_line(item)}")
         lines.append("\n也可用 /danbooru_tags 关键词 继续查看更多候选。")
         lines.append("管理员可用 /danbooru_alias 中文 英文tag 写入本地词典。")
@@ -883,7 +1113,13 @@ class DanbooruPlugin(Star):
 
     def _format_resolution_error(self, resolution: TagResolution) -> str:
         if resolution.api_failed:
-            return "Danbooru 标签校验接口暂时不可用，本次没有发送未验证标签。稍后再试。"
+            if not any(CJK_RE.search(item) for item in resolution.unknown_tags):
+                return "Danbooru 标签校验接口暂时不可用，本次没有发送未验证标签。稍后再试。"
+            return (
+                "DanbooruSearchOnline 暂时不可用，本次没有发送未验证标签。"
+                "若 HF Space 正在冷启动，请等待 30～60 秒后重试，或先访问：\n"
+                "https://huggingface.co/spaces/SAkizuki/DanbooruSearch"
+            )
 
         lines = ["没有识别到可验证的 Danbooru tag。"]
         if resolution.unknown_tags:
@@ -1411,6 +1647,8 @@ class DanbooruPlugin(Star):
             "                       例：/danbooru_r18 hatsune_miku:100",
             "  /danbooru_comic [tag…][:分数]  单独搜索漫画",
             "                       例：/danbooru_comic touhou:50",
+            "  /danbooru_artists 标签…  仅推荐擅长画师，不请求 Danbooru 图片 API",
+            "                       例：/danbooru_artists 平涂 1girl",
             "  /danbooru_tags 关键词  查看候选 tag（英文前缀或中文）",
             "                       例：/danbooru_tags hatsune_mi",
             "                       例：/danbooru_tags 芙莉莲",
@@ -1426,8 +1664,8 @@ class DanbooruPlugin(Star):
             "  · 漫画命令固定占用 comic 这 1 个 tag；默认额度为 2 时还能再写 1 个 tag",
             "  · R18 命令仅查询 Questionable + Explicit；普通命令不会返回这两类",
             "  · 搜图通常只调用一次 posts API；随机池和近期 ID 去重会减少连续重复",
-            "  · 中文通过对照服务 + 本地/配置词典映射，不靠 LLM 猜 tag",
-            "  · 同一中文对应多个热门角色时，会列出候选让你复制精确 tag",
+            "  · 中文通过 DanbooruSearchOnline + 本地/配置词典映射，不靠 LLM 猜 tag",
+            "  · 高置信度结果直接搜图；低于阈值时返回 5～10 个候选，不静默猜测",
             "  · 英文拼写仅自动修正下划线/连字符差异与官方 alias",
         ]
         if for_admin:
@@ -1444,6 +1682,12 @@ class DanbooruPlugin(Star):
                     "                       列出本地别名（可过滤）",
                     "  /danbooru_suggest_log [条数]",
                     "                       查看最近中文对照/歧义建议日志（默认 10）",
+                    "  /danbooru_api_params [show]",
+                    "                       查看 DanbooruSearchOnline 当前参数",
+                    "  /danbooru_api_params 参数=值 [参数=值…]",
+                    "                       修改并持久化 API 搜索/画师参数",
+                    "  /danbooru_api_params reset",
+                    "                       重置参数（保留 API 地址）",
                     "",
                     "权限：配置 alias_admin_ids，或平台管理员身份。",
                     f"本地词典路径：{LOCAL_ALIASES_FILE}",
@@ -1480,7 +1724,7 @@ class DanbooruPlugin(Star):
         /danbooru 爱丽丝              # 多个候选时会列出引导，不静默选择
         /danbooru                     # 随机普通评级图片（最低分默认 0）
 
-        中文通过对照服务 + 手工词典映射；不会让 LLM 直接发明 tag。
+        中文通过 DanbooruSearchOnline + 手工词典映射；不会让 LLM 直接发明 tag。
         """
         await self._handle_request(
             event,
@@ -1510,6 +1754,162 @@ class DanbooruPlugin(Star):
             search_mode="comic",
         )
 
+    @filter.command("danbooru_artists")
+    async def danbooru_artists_command(self, event: AstrMessageEvent):
+        """根据标签推荐擅长画师；只调用 DanbooruSearchOnline，不搜图。"""
+        user_input = self._extract_keyword(event.message_str, "danbooru_artists").strip()
+        if not user_input:
+            await event.send(
+                event.plain_result(
+                    "用法：/danbooru_artists 中文概念或英文tag [更多tag…]\n"
+                    "例：/danbooru_artists 平涂\n"
+                    "例：/danbooru_artists flat_color 1girl"
+                )
+            )
+            return
+        remaining = self._check_cooldown(event)
+        if remaining > 0:
+            await event.send(event.plain_result(f"请稍等 {remaining} 秒再请求。"))
+            return
+
+        input_terms = self._manual_alias_terms(user_input)[:10]
+        seed_tags: list[str] = []
+        uncertain: dict[str, list[dict[str, Any]]] = {}
+        invalid: list[str] = []
+        for term in input_terms:
+            if CJK_RE.search(term):
+                try:
+                    candidates = await self._fetch_chinese_candidates(term)
+                except SearchOnlineError:
+                    await event.send(
+                        event.plain_result(
+                            "DanbooruSearchOnline 可能正在冷启动。请等待 30～60 秒后重试，"
+                            "或先访问服务主页唤醒：\n"
+                            "https://huggingface.co/spaces/SAkizuki/DanbooruSearch"
+                        )
+                    )
+                    return
+                official, ambiguous, suggestions = self._pick_chinese_official(term, candidates)
+                if official:
+                    if official not in seed_tags:
+                        seed_tags.append(official)
+                elif ambiguous and suggestions:
+                    uncertain[term] = suggestions
+                else:
+                    invalid.append(term)
+                continue
+            safe = self._safe_tag_token(term.lower())
+            if safe:
+                if safe not in seed_tags:
+                    seed_tags.append(safe)
+            else:
+                invalid.append(term)
+
+        if uncertain:
+            lines = ["以下输入的语义匹配置信度不足，请改用候选英文 tag 后重试："]
+            limit = min(10, max(5, self._search_api_int("candidate_limit")))
+            for source, candidates in uncertain.items():
+                lines.append(f"\n「{source}」候选：")
+                lines.extend(f"  · {self._format_candidate_line(item)}" for item in candidates[:limit])
+            lines.append("\n本次没有调用 Danbooru 图片 API，也没有发送图片。")
+            await event.send(event.plain_result("\n".join(lines)))
+            return
+        if not seed_tags:
+            message = "没有识别到可用于画师推荐的标签。"
+            if invalid:
+                message += "\n未识别：" + "、".join(invalid)
+            await event.send(event.plain_result(message))
+            return
+
+        payload = await self._fetch_recommended_artists(seed_tags)
+        error = str(payload.get("error") or "").strip()
+        if error:
+            invalid_tags = payload.get("invalid_tags") or []
+            if invalid_tags:
+                error += "\n无效标签：" + "、".join(str(item) for item in invalid_tags)
+            await event.send(event.plain_result(error))
+            return
+        results = payload.get("results") or []
+        if not isinstance(results, list) or not results:
+            await event.send(event.plain_result("没有找到擅长这些标签的画师。"))
+            return
+
+        lines = ["擅长画师推荐（仅来自 DanbooruSearchOnline）：", "种子标签：" + " ".join(seed_tags)]
+        correction_note = str(payload.get("correction_note") or "").strip()
+        if correction_note:
+            lines.append(correction_note)
+        for index, item in enumerate(results[: self._search_api_int("artist_limit")], start=1):
+            if not isinstance(item, dict):
+                continue
+            artist = str(item.get("artist") or "").strip()
+            if not artist:
+                continue
+            cooc_count = int(item.get("cooc_count") or 0)
+            post_count = int(item.get("post_count") or 0)
+            top_tags = [str(tag) for tag in (item.get("top_tags") or [])[:5]]
+            detail = f"共现 {cooc_count}，作品 {post_count}"
+            if top_tags:
+                detail += "；擅长 " + ", ".join(top_tags)
+            lines.append(f"{index}. {artist}（{detail}）")
+        self._mark_request(event)
+        await event.send(event.plain_result("\n".join(lines)))
+
+    @filter.command("danbooru_api_params")
+    async def danbooru_api_params_command(self, event: AstrMessageEvent):
+        """管理员：查看、修改或重置 DanbooruSearchOnline 请求参数。"""
+        if not self._is_alias_admin(event):
+            await event.send(event.plain_result("无权限。需要管理员或配置中的 alias_admin_ids。"))
+            return
+        args = self._extract_keyword(event.message_str, "danbooru_api_params").strip()
+        if not args or args.casefold() in {"show", "list", "查看"}:
+            await event.send(event.plain_result(self._format_search_api_params()))
+            return
+        if args.casefold() in {"reset", "重置"}:
+            try:
+                current = self._search_api_config()
+                api_base_url = current.get("api_base_url", DEFAULT_SEARCH_API_BASE_URL)
+                reset = dict(SEARCH_API_DEFAULTS)
+                reset["api_base_url"] = api_base_url
+                self._save_search_api_config(reset)
+            except Exception as exc:
+                logger.exception("[Danbooru] 重置搜索 API 参数失败")
+                await event.send(event.plain_result(f"参数重置失败：{exc}"))
+                return
+            await event.send(event.plain_result("已重置 DanbooruSearchOnline 搜索与画师参数。\n" + self._format_search_api_params()))
+            return
+
+        assignments: list[tuple[str, str]] = []
+        if "=" in args:
+            for token in args.split():
+                if "=" not in token:
+                    await event.send(event.plain_result(f"参数格式错误：{token}；请使用 参数=值。"))
+                    return
+                key, value = token.split("=", 1)
+                assignments.append((key.strip(), value.strip()))
+        else:
+            parts = args.split(maxsplit=1)
+            if len(parts) != 2:
+                await event.send(event.plain_result(self._format_search_api_params()))
+                return
+            assignments.append((parts[0].strip(), parts[1].strip()))
+
+        section = self._search_api_config()
+        changed: list[str] = []
+        try:
+            for key, raw_value in assignments:
+                parsed = self._parse_search_api_param(key, raw_value)
+                section[key] = parsed
+                changed.append(f"{key}={parsed}")
+            self._save_search_api_config(section)
+        except ValueError as exc:
+            await event.send(event.plain_result(f"参数未修改：{exc}"))
+            return
+        except Exception as exc:
+            logger.exception("[Danbooru] 保存搜索 API 参数失败")
+            await event.send(event.plain_result(f"参数保存失败：{exc}"))
+            return
+        await event.send(event.plain_result("已保存并立即生效：\n  " + "\n  ".join(changed)))
+
     @filter.command("danbooru_tags")
     async def danbooru_tags_command(self, event: AstrMessageEvent):
         """显示 tag 候选（支持英文前缀或中文关键词）。
@@ -1532,9 +1932,19 @@ class DanbooruPlugin(Star):
             )
             return
 
-        # 中文关键词 → 对照服务
+        # 中文关键词 → DanbooruSearchOnline 语义搜索
         if CJK_RE.search(keyword) and self._config_bool("enable_chinese_lookup", True):
-            candidates = await self._fetch_chinese_candidates(keyword)
+            try:
+                candidates = await self._fetch_chinese_candidates(keyword)
+            except SearchOnlineError:
+                await event.send(
+                    event.plain_result(
+                        "DanbooruSearchOnline 可能正在冷启动。请等待 30～60 秒后重试，"
+                        "或先访问服务主页唤醒：\n"
+                        "https://huggingface.co/spaces/SAkizuki/DanbooruSearch"
+                    )
+                )
+                return
             self._append_suggestion_log(
                 action="tags_query",
                 input_term=keyword,
@@ -1544,14 +1954,15 @@ class DanbooruPlugin(Star):
             if not candidates:
                 await event.send(
                     event.plain_result(
-                        f"中文对照未找到与「{keyword}」相关的官方 tag。\n"
+                        f"DanbooruSearchOnline 未找到与「{keyword}」相关的官方 tag。\n"
                         "可尝试更常见的译名，或改用英文前缀查询。"
                     )
                 )
                 return
 
-            lines = [f"中文对照候选：「{keyword}」"]
-            for item in candidates[:12]:
+            lines = [f"中文语义候选：「{keyword}」"]
+            candidate_limit = min(10, max(5, self._search_api_int("candidate_limit")))
+            for item in candidates[:candidate_limit]:
                 lines.append(f"- {self._format_candidate_line(item)}")
             lines.append("\n复制规范英文 tag 后使用 /danbooru 即可搜图。")
             if self._is_alias_admin(event):
